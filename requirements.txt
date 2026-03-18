@@ -1,0 +1,13 @@
+numpy>=1.26
+pandas>=2.2
+scikit-learn>=1.8
+matplotlib>=3.8
+seaborn>=0.13
+joblib>=1.4
+shap>=0.46
+xgboost>=2.1
+lightgbm>=4.5
+python-docx>=1.2
+pyyaml>=6.0
+nbformat>=5.10
+jupyter>=1.0

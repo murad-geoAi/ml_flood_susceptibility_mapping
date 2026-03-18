@@ -1,0 +1,13 @@
+metric,value
+original_rows,15000.0
+missing_target_rows,12.0
+labeled_rows,14988.0
+class_0_count,10879.0
+class_1_count,4109.0
+positive_rate,0.2741526554576995
+duplicate_rows,0.0
+duplicate_coordinate_pairs,0.0
+point_x_min,258603.0099
+point_x_max,353806.5372
+point_y_min,2436798.937
+point_y_max,2575469.264

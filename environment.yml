@@ -1,0 +1,19 @@
+name: flood-susceptibility-ml
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - joblib
+  - shap
+  - xgboost
+  - lightgbm
+  - python-docx
+  - pyyaml
+  - nbformat
+  - jupyter
+  - pip

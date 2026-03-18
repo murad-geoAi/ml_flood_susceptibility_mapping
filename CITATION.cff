@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+title: "Flood Susceptibility ML"
+message: "If you use this repository, please cite the software and the related conference manuscript."
+type: software
+authors:
+  - name: "Flood Susceptibility ML Project Team"
+version: 1.0.0
+date-released: 2026-03-18
+license: MIT
+repository-code: "https://github.com/your-org/flood-susceptibility-ml"
