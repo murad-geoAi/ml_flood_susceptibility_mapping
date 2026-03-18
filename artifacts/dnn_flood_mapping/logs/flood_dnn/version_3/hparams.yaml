@@ -1,0 +1,9 @@
+dropout: 0.25
+hidden_dims:
+- 128
+- 64
+- 32
+input_dim: 31
+learning_rate: 0.001
+pos_weight: 2.629674306393245
+weight_decay: 0.0001

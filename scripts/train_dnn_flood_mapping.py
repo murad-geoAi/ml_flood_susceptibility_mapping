@@ -22,6 +22,7 @@ import torch
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
 from sklearn.calibration import calibration_curve
+from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
@@ -39,7 +40,8 @@ from sklearn.metrics import (
     roc_curve,
 )
 from sklearn.model_selection import StratifiedGroupKFold, train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -61,13 +63,18 @@ class SplitBundle:
 @dataclass
 class PreparedData:
     feature_names: list[str]
+    source_feature_names: list[str]
+    categorical_feature_names: list[str]
+    indicator_feature_names: list[str]
+    continuous_feature_names: list[str]
+    continuous_feature_start_index: int
     coordinate_columns: list[str]
     split_strategy: str
     split_summary: dict[str, Any]
     train: SplitBundle
     validation: SplitBundle
     test: SplitBundle
-    imputer: SimpleImputer
+    feature_transformer: ColumnTransformer
     scaler: StandardScaler
 
 
@@ -78,11 +85,13 @@ class FloodTensorDataset(Dataset):
         labels: np.ndarray,
         training: bool = False,
         gaussian_noise_std: float = 0.0,
+        continuous_feature_start_index: int | None = None,
     ) -> None:
         self.features = torch.tensor(features, dtype=torch.float32)
         self.labels = torch.tensor(labels, dtype=torch.float32)
         self.training = training
         self.gaussian_noise_std = gaussian_noise_std
+        self.continuous_feature_start_index = continuous_feature_start_index
 
     def __len__(self) -> int:
         return len(self.labels)
@@ -90,7 +99,15 @@ class FloodTensorDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.features[index]
         if self.training and self.gaussian_noise_std > 0.0:
-            x = x + torch.randn_like(x) * self.gaussian_noise_std
+            if self.continuous_feature_start_index is None:
+                x = x + torch.randn_like(x) * self.gaussian_noise_std
+            else:
+                x = x.clone()
+                x[self.continuous_feature_start_index :] = (
+                    x[self.continuous_feature_start_index :]
+                    + torch.randn_like(x[self.continuous_feature_start_index :])
+                    * self.gaussian_noise_std
+                )
         return x, self.labels[index]
 
 
@@ -114,6 +131,7 @@ class FloodDataModule(pl.LightningDataModule):
             self.prepared.train.labels,
             training=True,
             gaussian_noise_std=self.gaussian_noise_std,
+            continuous_feature_start_index=self.prepared.continuous_feature_start_index,
         )
         self.validation_dataset = FloodTensorDataset(
             self.prepared.validation.features_scaled,
@@ -288,6 +306,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Include coordinates as model inputs. Disabled by default to reduce leakage risk.",
     )
     parser.add_argument(
+        "--categorical-columns",
+        nargs="*",
+        default=["LULC"],
+        help="Columns that should be encoded as categorical classes instead of scaled as continuous values.",
+    )
+    parser.add_argument(
+        "--cyclical-angle-columns",
+        nargs="*",
+        default=["Aspect"],
+        help="Angular columns in degrees that should be expanded to sine/cosine features.",
+    )
+    parser.add_argument(
         "--split-strategy",
         choices=["spatial", "stratified"],
         default="spatial",
@@ -431,17 +461,30 @@ def create_split_indices(
 def build_split_bundle(
     source_frame: pd.DataFrame,
     index: np.ndarray,
-    feature_names: list[str],
+    source_feature_names: list[str],
     target_column: str,
     coordinate_columns: list[str],
-    imputer: SimpleImputer,
+    cyclical_angle_columns: list[str],
+    feature_transformer: ColumnTransformer,
     scaler: StandardScaler,
+    categorical_feature_names: list[str],
+    indicator_feature_names: list[str],
+    continuous_feature_names: list[str],
+    transformed_feature_names: list[str],
 ) -> SplitBundle:
     subset = source_frame.iloc[index].reset_index(drop=True)
-    raw_features = subset[feature_names].apply(pd.to_numeric, errors="coerce")
-    imputed = imputer.transform(raw_features)
-    scaled = scaler.transform(imputed)
-    display_features = pd.DataFrame(imputed, columns=feature_names)
+    engineered_features = engineer_feature_frame(
+        subset,
+        source_feature_names,
+        cyclical_angle_columns,
+    )
+    unscaled_features = feature_transformer.transform(engineered_features).astype(np.float32)
+    scaled = apply_scaler_to_continuous_block(
+        unscaled_features,
+        scaler,
+        continuous_feature_names,
+    )
+    display_features = pd.DataFrame(unscaled_features, columns=transformed_feature_names)
     metadata_columns = ["sample_id", *coordinate_columns, target_column]
     metadata = subset[metadata_columns].copy()
     metadata.rename(columns={target_column: "observed_class"}, inplace=True)
@@ -451,6 +494,65 @@ def build_split_bundle(
         labels=subset[target_column].astype(int).to_numpy(),
         metadata=metadata,
     )
+
+
+def engineer_feature_frame(
+    source_frame: pd.DataFrame,
+    source_feature_names: list[str],
+    cyclical_angle_columns: list[str],
+) -> pd.DataFrame:
+    feature_frame = source_frame[source_feature_names].apply(pd.to_numeric, errors="coerce").copy()
+    for column in source_feature_names:
+        feature_frame[f"{column}_missing"] = feature_frame[column].isna().astype(np.float32)
+    for column in cyclical_angle_columns:
+        if column not in feature_frame.columns:
+            continue
+        radians = np.deg2rad(feature_frame[column] % 360.0)
+        feature_frame[f"{column}_sin"] = np.sin(radians)
+        feature_frame[f"{column}_cos"] = np.cos(radians)
+        feature_frame.drop(columns=column, inplace=True)
+    return feature_frame
+
+
+def format_categorical_feature_name(feature_name: str) -> str:
+    if "_" not in feature_name:
+        return feature_name
+    column_name, category = feature_name.rsplit("_", maxsplit=1)
+    if category.endswith(".0"):
+        category = category[:-2]
+    return f"{column_name}={category}"
+
+
+def get_transformed_feature_names(
+    feature_transformer: ColumnTransformer,
+    categorical_feature_names: list[str],
+    indicator_feature_names: list[str],
+    continuous_feature_names: list[str],
+) -> list[str]:
+    transformed_names: list[str] = []
+    if categorical_feature_names:
+        categorical_pipeline = feature_transformer.named_transformers_["cat"]
+        encoder = categorical_pipeline.named_steps["encoder"]
+        encoded_names = encoder.get_feature_names_out(categorical_feature_names)
+        transformed_names.extend(
+            format_categorical_feature_name(name) for name in encoded_names.tolist()
+        )
+    transformed_names.extend(indicator_feature_names)
+    transformed_names.extend(continuous_feature_names)
+    return transformed_names
+
+
+def apply_scaler_to_continuous_block(
+    features: np.ndarray,
+    scaler: StandardScaler,
+    continuous_feature_names: list[str],
+) -> np.ndarray:
+    scaled = features.copy()
+    if not continuous_feature_names:
+        return scaled
+    start_index = features.shape[1] - len(continuous_feature_names)
+    scaled[:, start_index:] = scaler.transform(features[:, start_index:])
+    return scaled
 
 
 def prepare_dataset(args: argparse.Namespace) -> PreparedData:
@@ -464,7 +566,9 @@ def prepare_dataset(args: argparse.Namespace) -> PreparedData:
     excluded_columns = {"sample_id", args.target_column}
     if not args.include_coordinate_features:
         excluded_columns.update(args.coordinate_columns)
-    feature_names = [column for column in raw_frame.columns if column not in excluded_columns]
+    source_feature_names = [
+        column for column in raw_frame.columns if column not in excluded_columns
+    ]
     train_idx, validation_idx, test_idx, split_summary = create_split_indices(
         raw_frame,
         raw_frame[args.target_column],
@@ -472,46 +576,126 @@ def prepare_dataset(args: argparse.Namespace) -> PreparedData:
     )
 
     train_frame = raw_frame.iloc[train_idx].reset_index(drop=True)
-    training_features = train_frame[feature_names].apply(pd.to_numeric, errors="coerce")
-    imputer = SimpleImputer(strategy="median")
+    training_features = engineer_feature_frame(
+        train_frame,
+        source_feature_names,
+        args.cyclical_angle_columns,
+    )
+    categorical_feature_names = [
+        column for column in args.categorical_columns if column in training_features.columns
+    ]
+    indicator_feature_names = [
+        column for column in training_features.columns if column.endswith("_missing")
+    ]
+    continuous_feature_names = [
+        column
+        for column in training_features.columns
+        if column not in categorical_feature_names and column not in indicator_feature_names
+    ]
+    feature_transformers: list[tuple[str, Any, list[str]]] = []
+    if categorical_feature_names:
+        feature_transformers.append(
+            (
+                "cat",
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        (
+                            "encoder",
+                            OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+                        ),
+                    ]
+                ),
+                categorical_feature_names,
+            )
+        )
+    if indicator_feature_names:
+        feature_transformers.append(
+            ("indicator", "passthrough", indicator_feature_names)
+        )
+    if continuous_feature_names:
+        feature_transformers.append(
+            ("num", SimpleImputer(strategy="median"), continuous_feature_names)
+        )
+    feature_transformer = ColumnTransformer(
+        transformers=feature_transformers,
+        remainder="drop",
+        sparse_threshold=0.0,
+    )
     scaler = StandardScaler()
-    training_imputed = imputer.fit_transform(training_features)
-    scaler.fit(training_imputed)
+    training_transformed = feature_transformer.fit_transform(training_features).astype(np.float32)
+    transformed_feature_names = get_transformed_feature_names(
+        feature_transformer,
+        categorical_feature_names,
+        indicator_feature_names,
+        continuous_feature_names,
+    )
+    if continuous_feature_names:
+        start_index = len(transformed_feature_names) - len(continuous_feature_names)
+        scaler.fit(training_transformed[:, start_index:])
+    else:
+        start_index = len(transformed_feature_names)
+        scaler.fit(np.zeros((len(training_transformed), 1), dtype=np.float32))
 
     train_bundle = build_split_bundle(
         raw_frame,
         train_idx,
-        feature_names,
+        source_feature_names,
         args.target_column,
         args.coordinate_columns,
-        imputer,
+        args.cyclical_angle_columns,
+        feature_transformer,
         scaler,
+        categorical_feature_names,
+        indicator_feature_names,
+        continuous_feature_names,
+        transformed_feature_names,
     )
     validation_bundle = build_split_bundle(
         raw_frame,
         validation_idx,
-        feature_names,
+        source_feature_names,
         args.target_column,
         args.coordinate_columns,
-        imputer,
+        args.cyclical_angle_columns,
+        feature_transformer,
         scaler,
+        categorical_feature_names,
+        indicator_feature_names,
+        continuous_feature_names,
+        transformed_feature_names,
     )
     test_bundle = build_split_bundle(
         raw_frame,
         test_idx,
-        feature_names,
+        source_feature_names,
         args.target_column,
         args.coordinate_columns,
-        imputer,
+        args.cyclical_angle_columns,
+        feature_transformer,
         scaler,
+        categorical_feature_names,
+        indicator_feature_names,
+        continuous_feature_names,
+        transformed_feature_names,
     )
 
     split_summary.update(
         {
             "dropped_rows_with_missing_target": int(original_row_count - len(raw_frame)),
             "total_rows_after_target_drop": int(len(raw_frame)),
-            "feature_count": int(len(feature_names)),
-            "features_used": feature_names,
+            "source_feature_count": int(len(source_feature_names)),
+            "model_feature_count": int(len(transformed_feature_names)),
+            "features_used": source_feature_names,
+            "model_features_used": transformed_feature_names,
+            "categorical_feature_names": categorical_feature_names,
+            "indicator_feature_names": indicator_feature_names,
+            "continuous_feature_names": continuous_feature_names,
+            "cyclical_angle_columns": [
+                column
+                for column in args.cyclical_angle_columns
+                if column in source_feature_names
+            ],
             "coordinates_used_as_features": bool(args.include_coordinate_features),
             "train_rows": int(len(train_bundle.labels)),
             "validation_rows": int(len(validation_bundle.labels)),
@@ -522,14 +706,19 @@ def prepare_dataset(args: argparse.Namespace) -> PreparedData:
         }
     )
     return PreparedData(
-        feature_names=feature_names,
+        feature_names=transformed_feature_names,
+        source_feature_names=source_feature_names,
+        categorical_feature_names=categorical_feature_names,
+        indicator_feature_names=indicator_feature_names,
+        continuous_feature_names=continuous_feature_names,
+        continuous_feature_start_index=start_index,
         coordinate_columns=args.coordinate_columns,
         split_strategy=args.split_strategy,
         split_summary=split_summary,
         train=train_bundle,
         validation=validation_bundle,
         test=test_bundle,
-        imputer=imputer,
+        feature_transformer=feature_transformer,
         scaler=scaler,
     )
 
@@ -563,6 +752,11 @@ def save_processed_data(prepared: PreparedData, processed_dir: Path) -> None:
         json.dump(
             {
                 "feature_names": prepared.feature_names,
+                "source_feature_names": prepared.source_feature_names,
+                "categorical_feature_names": prepared.categorical_feature_names,
+                "indicator_feature_names": prepared.indicator_feature_names,
+                "continuous_feature_names": prepared.continuous_feature_names,
+                "continuous_feature_start_index": prepared.continuous_feature_start_index,
                 "coordinate_columns": prepared.coordinate_columns,
                 "split_summary": prepared.split_summary,
             },
@@ -573,9 +767,14 @@ def save_processed_data(prepared: PreparedData, processed_dir: Path) -> None:
     with (processed_dir / "preprocessing.pkl").open("wb") as handle:
         pickle.dump(
             {
-                "imputer": prepared.imputer,
+                "feature_transformer": prepared.feature_transformer,
                 "scaler": prepared.scaler,
                 "feature_names": prepared.feature_names,
+                "source_feature_names": prepared.source_feature_names,
+                "categorical_feature_names": prepared.categorical_feature_names,
+                "indicator_feature_names": prepared.indicator_feature_names,
+                "continuous_feature_names": prepared.continuous_feature_names,
+                "continuous_feature_start_index": prepared.continuous_feature_start_index,
                 "coordinate_columns": prepared.coordinate_columns,
                 "split_summary": prepared.split_summary,
             },

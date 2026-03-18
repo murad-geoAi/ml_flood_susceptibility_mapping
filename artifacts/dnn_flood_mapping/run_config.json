@@ -8,6 +8,12 @@
     "POINT_Y"
   ],
   "include_coordinate_features": false,
+  "categorical_columns": [
+    "LULC"
+  ],
+  "cyclical_angle_columns": [
+    "Aspect"
+  ],
   "split_strategy": "spatial",
   "spatial_block_size": 5000.0,
   "spatial_folds": 10,
