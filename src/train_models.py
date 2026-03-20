@@ -188,6 +188,15 @@ def build_model_specs(n_jobs: int) -> list[ModelSpec]:
     return specs
 
 
+def get_model_spec(model_name: str, n_jobs: int) -> ModelSpec:
+    specs = build_model_specs(n_jobs)
+    for spec in specs:
+        if spec.name == model_name:
+            return spec
+    available = ", ".join(spec.name for spec in specs)
+    raise KeyError(f"Model {model_name} not found. Available models: {available}")
+
+
 def fit_model(
     spec: ModelSpec,
     model: Any,
@@ -237,6 +246,61 @@ def predict_probabilities(model: Any, features: pd.DataFrame) -> np.ndarray:
     raise TypeError(f"Model {type(model).__name__} does not expose probability predictions.")
 
 
+def train_single_model(
+    prepared: Any,
+    spec: ModelSpec,
+    models_dir: Path,
+    seed: int,
+) -> ModelResult:
+    models_dir.mkdir(parents=True, exist_ok=True)
+    sample_weight_train = compute_sample_weight(class_weight="balanced", y=prepared.train.labels)
+    sample_weight_validation = compute_sample_weight(
+        class_weight="balanced", y=prepared.validation.labels
+    )
+
+    model = spec.builder(seed)
+    model = fit_model(
+        spec=spec,
+        model=model,
+        x_train=prepared.train.features,
+        y_train=prepared.train.labels,
+        x_validation=prepared.validation.features,
+        y_validation=prepared.validation.labels,
+        sample_weight_train=sample_weight_train,
+        sample_weight_validation=sample_weight_validation,
+    )
+    validation_probabilities = predict_probabilities(model, prepared.validation.features)
+    test_probabilities = predict_probabilities(model, prepared.test.features)
+    threshold, threshold_frame = choose_threshold(
+        prepared.validation.labels,
+        validation_probabilities,
+    )
+    validation_metrics = compute_binary_metrics(
+        prepared.validation.labels,
+        validation_probabilities,
+        threshold,
+    )
+    test_metrics = compute_binary_metrics(
+        prepared.test.labels,
+        test_probabilities,
+        threshold,
+    )
+    model_path = models_dir / f"{slugify(spec.name)}.joblib"
+    joblib.dump(model, model_path)
+    return ModelResult(
+        name=spec.name,
+        family=spec.family,
+        model=model,
+        threshold=threshold,
+        threshold_frame=threshold_frame,
+        validation_metrics=validation_metrics,
+        test_metrics=test_metrics,
+        validation_probabilities=validation_probabilities,
+        test_probabilities=test_probabilities,
+        model_path=model_path,
+    )
+
+
 def benchmark_models(
     prepared: Any,
     models_dir: Path,
@@ -246,62 +310,33 @@ def benchmark_models(
     benchmark_model_name: str,
 ) -> BenchmarkResult:
     models_dir.mkdir(parents=True, exist_ok=True)
-    sample_weight_train = compute_sample_weight(class_weight="balanced", y=prepared.train.labels)
-    sample_weight_validation = compute_sample_weight(
-        class_weight="balanced", y=prepared.validation.labels
-    )
-
     results: list[ModelResult] = []
     validation_rows: list[dict[str, Any]] = []
     test_rows: list[dict[str, Any]] = []
     for spec in build_model_specs(n_jobs):
-        model = spec.builder(seed)
-        model = fit_model(
+        result = train_single_model(
+            prepared=prepared,
             spec=spec,
-            model=model,
-            x_train=prepared.train.features,
-            y_train=prepared.train.labels,
-            x_validation=prepared.validation.features,
-            y_validation=prepared.validation.labels,
-            sample_weight_train=sample_weight_train,
-            sample_weight_validation=sample_weight_validation,
+            models_dir=models_dir,
+            seed=seed,
         )
-        validation_probabilities = predict_probabilities(model, prepared.validation.features)
-        test_probabilities = predict_probabilities(model, prepared.test.features)
-        threshold, threshold_frame = choose_threshold(
-            prepared.validation.labels,
-            validation_probabilities,
-        )
-        validation_metrics = compute_binary_metrics(
-            prepared.validation.labels,
-            validation_probabilities,
-            threshold,
-        )
-        test_metrics = compute_binary_metrics(
-            prepared.test.labels,
-            test_probabilities,
-            threshold,
-        )
-        model_path = models_dir / f"{slugify(spec.name)}.joblib"
-        joblib.dump(model, model_path)
-        results.append(
-            ModelResult(
-                name=spec.name,
-                family=spec.family,
-                model=model,
-                threshold=threshold,
-                threshold_frame=threshold_frame,
-                validation_metrics=validation_metrics,
-                test_metrics=test_metrics,
-                validation_probabilities=validation_probabilities,
-                test_probabilities=test_probabilities,
-                model_path=model_path,
-            )
-        )
+        results.append(result)
         validation_rows.append(
-            {"model": spec.name, "family": spec.family, "split": "validation", **validation_metrics}
+            {
+                "model": result.name,
+                "family": result.family,
+                "split": "validation",
+                **result.validation_metrics,
+            }
         )
-        test_rows.append({"model": spec.name, "family": spec.family, "split": "test", **test_metrics})
+        test_rows.append(
+            {
+                "model": result.name,
+                "family": result.family,
+                "split": "test",
+                **result.test_metrics,
+            }
+        )
 
     validation_frame = pd.DataFrame(validation_rows).sort_values(
         ["roc_auc", "average_precision", "f1"],
